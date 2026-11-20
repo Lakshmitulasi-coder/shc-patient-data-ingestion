@@ -18,6 +18,11 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+# Ensure project root is in sys.path when executed directly as a script
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from src.api_client import SHCPatientAPIClient
 from src.cleaner import read_and_clean_patient_data, save_cleaned_patients_to_csv
 
