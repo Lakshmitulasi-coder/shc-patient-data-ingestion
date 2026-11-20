@@ -8,6 +8,7 @@ import requests
 import responses
 
 from src.api_client import (
+    MAX_ALLOWED_RPS,
     RateLimiter,
     SHCPatientAPIClient,
     build_headers,
@@ -72,6 +73,17 @@ class TestUtilityFunctions:
 class TestRateLimiter:
     """Test suite for sliding-window rate limiter."""
 
+    def test_rate_limiter_enforces_hard_cap_of_5(self) -> None:
+        # Even when configured above 5.0 (e.g. 50.0), hard cap must limit it to 5.0
+        limiter = RateLimiter(max_requests_per_second=50.0, enforce_hard_cap=True)
+        assert limiter.max_rps == 5.0
+        assert limiter.max_rps == MAX_ALLOWED_RPS
+
+    def test_client_enforces_rate_limit_hard_cap(self, monkeypatch) -> None:
+        monkeypatch.setenv("RATE_LIMIT_RPS", "20.0")
+        client = SHCPatientAPIClient()
+        assert client.rate_limiter.max_rps == 5.0
+
     def test_rate_limiter_allows_burst_within_capacity(self) -> None:
         limiter = RateLimiter(max_requests_per_second=5.0)
         start = time.monotonic()
@@ -87,7 +99,7 @@ class TestRateLimiter:
         for _ in range(6):
             limiter.acquire()
         duration = time.monotonic() - start
-        # The 6th request must have waited for the 1.0s window to advance
+        # The 6th request must wait for the rolling window to advance
         assert duration >= 0.85
 
 
@@ -100,8 +112,8 @@ class TestSHCPatientAPIClient:
             base_url="https://api.mock-shc.com/v1/patients",
             api_token="test-secret-token-12345",
             batch_size=100,
-            rate_limit_rps=50.0,  # Fast for unit tests
-            max_retries=3,
+            rate_limit_rps=5.0,
+            max_retries=3,  # 3 retry attempts following initial request
             initial_backoff=0.01,  # Short delays for fast unit tests
             backoff_factor=1.5,
             failed_records_file=tmp_path / "failed_records.json",
@@ -200,9 +212,11 @@ class TestSHCPatientAPIClient:
         assert len(responses.calls) == 2
 
     @responses.activate
-    def test_retries_exhausted_saves_failed_record(self, client: SHCPatientAPIClient) -> None:
-        # All 3 attempts return 500
-        for _ in range(3):
+    def test_retries_exhausted_performs_expected_retry_attempts(
+        self, client: SHCPatientAPIClient
+    ) -> None:
+        # With max_retries=3: 1 initial attempt + 3 retries = 4 total requests
+        for _ in range(4):
             responses.add(
                 responses.POST,
                 "https://api.mock-shc.com/v1/patients",
@@ -214,7 +228,8 @@ class TestSHCPatientAPIClient:
         result = client.send_batch(batch, batch_index=1)
 
         assert result.status == "FAILED_RETRIES_EXHAUSTED"
-        assert len(responses.calls) == 3
+        assert result.retries_used == 3
+        assert len(responses.calls) == 4
 
         # Verify failed record written
         saved = json.loads(client.failed_records_file.read_text(encoding="utf-8"))
@@ -223,7 +238,6 @@ class TestSHCPatientAPIClient:
 
     @responses.activate
     def test_ingest_all_continues_after_http_400_batch(self, client: SHCPatientAPIClient) -> None:
-        # Set batch size to 2
         client.batch_size = 2
 
         # Batch 1 returns 400

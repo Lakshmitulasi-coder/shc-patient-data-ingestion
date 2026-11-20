@@ -6,9 +6,11 @@ for transmitting normalized patient records to the SHC platform.
 Features:
 - Bearer token authentication with credential masking in logs.
 - Automatic payload batching (default max 100 records per request).
-- Sliding-window rate limiter strictly enforcing <= 5 requests per second.
+- Sliding-window rate limiter strictly enforcing an absolute maximum of <= 5
+  requests per second, regardless of environment configuration.
 - Exponential backoff with jitter for HTTP 429, HTTP 5xx, and network errors.
-- HTTP 429 'Retry-After' header support.
+- Dynamic HTTP 429 'Retry-After' header support.
+- Configurable MAX_RETRIES representing the number of retry attempts after initial failure.
 - Specialized HTTP 400 Bad Request isolation to 'failed_records.json' without
   halting the pipeline for subsequent batches.
 - Comprehensive structured logging without secret leaks.
@@ -28,10 +30,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
 
 logger = logging.getLogger("shc_ingestion.api_client")
+
+# Absolute maximum API rate permitted by the SHC platform specification
+MAX_ALLOWED_RPS: float = 5.0
 
 
 def mask_token(token: Optional[str]) -> str:
@@ -95,7 +98,7 @@ def calculate_backoff_delay(
     Formula: delay = min(max_delay, initial_backoff * (backoff_factor ** (attempt - 1))) + jitter
 
     Args:
-        attempt: 1-based attempt counter (1, 2, 3...).
+        attempt: 1-based retry attempt counter (1, 2, 3...).
         initial_backoff: Base delay in seconds.
         backoff_factor: Multiplier per attempt.
         max_delay: Cap on delay in seconds.
@@ -111,10 +114,26 @@ def calculate_backoff_delay(
 
 
 class RateLimiter:
-    """Sliding-window rate limiter ensuring requests do not exceed max_rps."""
+    """Sliding-window rate limiter strictly enforcing max_requests_per_second."""
 
-    def __init__(self, max_requests_per_second: float = 5.0) -> None:
-        self.max_rps = max(0.1, float(max_requests_per_second))
+    def __init__(
+        self,
+        max_requests_per_second: float = 5.0,
+        enforce_hard_cap: bool = True,
+    ) -> None:
+        """Initialize sliding-window rate limiter.
+
+        Args:
+            max_requests_per_second: Desired rate limit.
+            enforce_hard_cap: If True, clamps rate to MAX_ALLOWED_RPS (5.0 req/s).
+        """
+        raw_rps = max(0.1, float(max_requests_per_second))
+        if enforce_hard_cap:
+            # Enforce an absolute maximum API rate of 5 requests per second per SHC platform specs
+            self.max_rps = min(MAX_ALLOWED_RPS, raw_rps)
+        else:
+            self.max_rps = raw_rps
+
         self.interval = 1.0  # 1-second rolling window
         self._timestamps: List[float] = []
         self._lock = threading.Lock()
@@ -227,14 +246,34 @@ class SHCPatientAPIClient:
         failed_records_file: str | Path = "failed_records.json",
         session: Optional[requests.Session] = None,
     ) -> None:
-        """Initialize API client with environment-aware defaults."""
+        """Initialize API client with environment-aware defaults.
+
+        Args:
+            base_url: REST endpoint URL.
+            api_token: Bearer authentication token.
+            batch_size: Maximum records per HTTP request (default 100).
+            rate_limit_rps: Desired requests per second (strictly capped at 5.0).
+            max_retries: Maximum retry attempts following an initial failure (default 3).
+            initial_backoff: Base exponential backoff delay in seconds.
+            backoff_factor: Multiplier per retry attempt.
+            request_timeout: Network socket timeout in seconds.
+            failed_records_file: File path to persist failed 400/retried batches.
+            session: Optional reusable requests.Session.
+        """
         self.base_url = (base_url or os.getenv("API_BASE_URL", "https://api.mock-shc.com/v1/patients")).rstrip("/")
         self.api_token = api_token or os.getenv("API_TOKEN", "")
         self.batch_size = int(os.getenv("BATCH_SIZE", str(batch_size)))
+
+        # Enforce an absolute maximum API rate of 5 requests per second, even if configured above 5
+        raw_configured_rps = float(os.getenv("RATE_LIMIT_RPS", str(rate_limit_rps)))
+        effective_rps = min(MAX_ALLOWED_RPS, max(0.1, raw_configured_rps))
         self.rate_limiter = RateLimiter(
-            max_requests_per_second=float(os.getenv("RATE_LIMIT_RPS", str(rate_limit_rps)))
+            max_requests_per_second=effective_rps,
+            enforce_hard_cap=True,
         )
-        self.max_retries = int(os.getenv("MAX_RETRIES", str(max_retries)))
+
+        # max_retries: number of retry attempts following an initial failure
+        self.max_retries = max(0, int(os.getenv("MAX_RETRIES", str(max_retries))))
         self.initial_backoff = float(os.getenv("INITIAL_BACKOFF", str(initial_backoff)))
         self.backoff_factor = float(os.getenv("BACKOFF_FACTOR", str(backoff_factor)))
         self.request_timeout = float(os.getenv("REQUEST_TIMEOUT", str(request_timeout)))
@@ -243,12 +282,13 @@ class SHCPatientAPIClient:
 
         masked_auth = mask_token(self.api_token)
         logger.info(
-            "Initialized SHCPatientAPIClient: URL=%s, Token=%s, BatchSize=%d, MaxRetries=%d, RateLimit=%.1frps",
+            "Initialized SHCPatientAPIClient: URL=%s, Token=%s, BatchSize=%d, MaxRetries=%d, RateLimit=%.1frps (HardCap=%.1f)",
             self.base_url,
             masked_auth,
             self.batch_size,
             self.max_retries,
             self.rate_limiter.max_rps,
+            MAX_ALLOWED_RPS,
         )
 
     def send_batch(
@@ -257,6 +297,11 @@ class SHCPatientAPIClient:
         batch_index: int = 1,
     ) -> BatchResult:
         """Send a single batch of patient records with rate-limiting and retries.
+
+        Retry policy:
+          - Initial request: Attempt 1
+          - Subsequent retries: Up to max_retries retry attempts (attempts 2 through 1 + max_retries)
+          - Total attempts possible: 1 + max_retries
 
         Behavior:
           - HTTP 200/201: Success logged.
@@ -285,9 +330,15 @@ class SHCPatientAPIClient:
             self.base_url,
         )
 
+        # Total attempts = 1 initial request + up to max_retries retries
+        total_attempts = 1 + self.max_retries
         retries_used = 0
 
-        for attempt in range(1, self.max_retries + 1):
+        for attempt_num in range(1, total_attempts + 1):
+            is_retry = attempt_num > 1
+            if is_retry:
+                retries_used += 1
+
             # Enforce rate limiter before each outbound request
             self.rate_limiter.acquire()
 
@@ -306,11 +357,12 @@ class SHCPatientAPIClient:
                 # Case 1: Success (2xx)
                 if 200 <= status_code < 300:
                     logger.info(
-                        "Batch %d: Successfully uploaded %d records (HTTP %d, latency %.1fms).",
+                        "Batch %d: Successfully uploaded %d records (HTTP %d, latency %.1fms, retries=%d).",
                         batch_index,
                         record_count,
                         status_code,
                         duration_ms,
+                        retries_used,
                     )
                     return BatchResult(
                         batch_index=batch_index,
@@ -354,50 +406,50 @@ class SHCPatientAPIClient:
 
                 # Case 3: HTTP 429 Too Many Requests (Rate limit exceeded)
                 if status_code == 429:
-                    retries_used += 1
                     retry_after_header = response.headers.get("Retry-After")
                     if retry_after_header and retry_after_header.isdigit():
                         delay = float(retry_after_header)
                         logger.warning(
-                            "Batch %d (attempt %d/%d): HTTP 429 Too Many Requests. "
+                            "Batch %d (retry %d/%d): HTTP 429 Too Many Requests. "
                             "Server requested Retry-After=%s seconds.",
                             batch_index,
-                            attempt,
+                            retries_used + 1,
                             self.max_retries,
                             retry_after_header,
                         )
                     else:
                         delay = calculate_backoff_delay(
-                            attempt, self.initial_backoff, self.backoff_factor
+                            retries_used + 1, self.initial_backoff, self.backoff_factor
                         )
                         logger.warning(
-                            "Batch %d (attempt %d/%d): HTTP 429 Rate limited. "
+                            "Batch %d (retry %d/%d): HTTP 429 Rate limited. "
                             "Backing off for %.2fs before retry.",
                             batch_index,
-                            attempt,
+                            retries_used + 1,
                             self.max_retries,
                             delay,
                         )
 
-                    if attempt < self.max_retries:
+                    if attempt_num < total_attempts:
                         time.sleep(delay)
                         continue
 
                 # Case 4: HTTP 5xx Server Errors (500, 502, 503, 504)
                 elif 500 <= status_code < 600:
-                    retries_used += 1
-                    delay = calculate_backoff_delay(attempt, self.initial_backoff, self.backoff_factor)
+                    delay = calculate_backoff_delay(
+                        retries_used + 1, self.initial_backoff, self.backoff_factor
+                    )
                     logger.warning(
-                        "Batch %d (attempt %d/%d): Server Error HTTP %d (%s). "
+                        "Batch %d (retry %d/%d): Server Error HTTP %d (%s). "
                         "Applying exponential backoff for %.2fs before retry.",
                         batch_index,
-                        attempt,
+                        retries_used + 1,
                         self.max_retries,
                         status_code,
                         response.text[:200],
                         delay,
                     )
-                    if attempt < self.max_retries:
+                    if attempt_num < total_attempts:
                         time.sleep(delay)
                         continue
 
@@ -431,42 +483,45 @@ class SHCPatientAPIClient:
                     )
 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as net_err:
-                retries_used += 1
-                delay = calculate_backoff_delay(attempt, self.initial_backoff, self.backoff_factor)
+                delay = calculate_backoff_delay(
+                    retries_used + 1, self.initial_backoff, self.backoff_factor
+                )
                 logger.warning(
-                    "Batch %d (attempt %d/%d): Network exception (%s: %s). "
+                    "Batch %d (retry %d/%d): Network exception (%s: %s). "
                     "Sleeping for %.2fs before retrying.",
                     batch_index,
-                    attempt,
+                    retries_used + 1,
                     self.max_retries,
                     type(net_err).__name__,
                     str(net_err),
                     delay,
                 )
-                if attempt < self.max_retries:
+                if attempt_num < total_attempts:
                     time.sleep(delay)
                     continue
 
             except requests.exceptions.RequestException as req_err:
-                retries_used += 1
-                delay = calculate_backoff_delay(attempt, self.initial_backoff, self.backoff_factor)
+                delay = calculate_backoff_delay(
+                    retries_used + 1, self.initial_backoff, self.backoff_factor
+                )
                 logger.error(
-                    "Batch %d (attempt %d/%d): Request error: %s. Backing off %.2fs.",
+                    "Batch %d (retry %d/%d): Request error: %s. Backing off %.2fs.",
                     batch_index,
-                    attempt,
+                    retries_used + 1,
                     self.max_retries,
                     req_err,
                     delay,
                 )
-                if attempt < self.max_retries:
+                if attempt_num < total_attempts:
                     time.sleep(delay)
                     continue
 
-        # Exhausted retries without 2xx
+        # Exhausted all retries without 2xx
         logger.error(
-            "Batch %d: Retries exhausted (%d attempts). Batch transmission failed. Saving to %s.",
+            "Batch %d: Exhausted %d retry attempts (total %d requests made). Batch transmission failed. Saving to %s.",
             batch_index,
             self.max_retries,
+            total_attempts,
             self.failed_records_file,
         )
         exhausted_entry = {
@@ -474,7 +529,7 @@ class SHCPatientAPIClient:
             "batch_index": batch_index,
             "status_code": None,
             "error_type": "RETRIES_EXHAUSTED",
-            "error_message": f"Exhausted {self.max_retries} attempts without receiving a 2xx response.",
+            "error_message": f"Exhausted {self.max_retries} retry attempts ({total_attempts} total requests) without receiving a 2xx response.",
             "record_count": record_count,
             "records": batch,
         }

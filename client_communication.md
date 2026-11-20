@@ -1,23 +1,25 @@
 # Client Communication: Technical Integration & Deployment Summary
 
 **To:** IT Director, GlobalHealth Corp  
-**From:** Senior Backend & Forward Deployed Engineering Team, SHC Technologies Pvt. Ltd.  
+**From:** Forward Deployed Engineering Team, SHC Technologies Pvt. Ltd.  
 **Date:** November 20, 2026  
-**Subject:** Delivery & Deployment Guide: Legacy Patient Data Ingestion & API Integration Engine  
+**Subject:** Technical Handover: Legacy Patient Data Extraction, Normalization & API Integration Engine  
 
 ---
 
 Dear Director,
 
-We have completed the deployment-ready implementation of the **Legacy System Integration & Data Ingestion Pipeline** for GlobalHealth Corp. This solution bridges your legacy electronic health record (EHR) CSV exports with our modern REST API platform, ensuring high data integrity, strict fault tolerance, and zero data loss.
+We have completed the deployment package for the **Legacy System Integration & Data Ingestion Pipeline** designed for GlobalHealth Corp. This solution extracts, sanitizes, and normalizes legacy patient management exports and prepares them for automated transmission to the SHC Platform REST API.
 
-Below is an executive and technical summary of the delivery, including operational deployment instructions, data-cleaning methodology, API resilience architecture, and our upstream recommendations for your engineering team.
+Please note that `https://api.mock-shc.com/v1/patients` is a mock specification endpoint; all network resilience, batching, rate limiting, and retry policies described below have been verified using automated mock HTTP test harnesses rather than live production uploads.
+
+Below is an overview of the technical implementation, operational deployment instructions, and data quality handling.
 
 ---
 
 ## 1. Quick Start: Docker Build and Execution
 
-The pipeline is packaged as a lightweight, hardened, multi-stage Docker container designed to run securely under an unprivileged user (`appuser`, UID 1001).
+The pipeline is packaged as a lightweight, hardened, multi-stage Docker container configured to run securely under an unprivileged Linux user (`appuser`, UID 1001).
 
 ### A. Building the Docker Image
 
@@ -62,50 +64,55 @@ docker run --rm \
 
 ## 2. Data Cleaning & Normalization Overview
 
-Legacy health data often arrives with formatting discrepancies, missing fields, and delimiter conflicts. Our extraction engine processes `data/patients.csv` and outputs clean, standardized data to `data/cleaned_patients.csv` following these rules:
+The extraction engine parses raw CSV exports and outputs standardized records into `data/cleaned_patients.csv` following these rules:
 
 1. **Missing Contact Information (Email & Phone):**
-   - In accordance with healthcare data interoperability, missing email addresses and phone numbers are normalized to clean empty strings without triggering pipeline exceptions or crashes.
+   - In accordance with healthcare data interoperability requirements, missing email addresses and phone numbers are normalized to empty strings (`""`) without crashing the pipeline.
 2. **Date of Birth (DOB) Normalization to ISO 8601 (`YYYY-MM-DD`):**
-   - The engine automatically recognizes and standardizes three legacy formats:
-     - `MM/DD/YYYY` (e.g., `04/15/1985` &rarr; `1985-04-15`)
-     - `DD-MM-YYYY` (e.g., `23-08-1976` &rarr; `1976-08-23`)
-     - `YYYY-MM-DD` (e.g., `1990-11-23` &rarr; `1990-11-23`)
-   - Invalid calendar dates (such as `1985-02-31`) are strictly rejected and logged with diagnostic rationale.
+   - Inconsistent date formats across facility records are parsed and standardized:
+     - `MM/DD/YYYY` (e.g., `12/31/1992` &rarr; `1992-12-31`)
+     - `DD-MM-YYYY` (e.g., `25-04-1975` &rarr; `1975-04-25`)
+     - `YYYY-MM-DD` (e.g., `1980-05-15` &rarr; `1980-05-15`)
+   - Invalid calendar dates (such as `1985-02-31`) are rejected and quarantined.
 3. **Account Balance Standardization:**
    - Multi-currency symbols (`$`, `€`, `₹`, `£`) are stripped.
-   - Comma thousand-separators (e.g., `"1,250.00"` &rarr; `1250.00`) are parsed accurately into standard IEEE floating-point numbers.
-   - Negative balances represented either via negative signs (`-$50.00`, `-50.00`) or standard accounting parentheses (`($120.50)` &rarr; `-120.50`) are strictly preserved.
+   - Comma thousand-separators (e.g., `"2,450.75"` &rarr; `2450.75`) are parsed into standard IEEE floating-point numbers.
+   - Negative balances (e.g., `$-15.00` &rarr; `-15.00` or accounting parentheses `($120.50)` &rarr; `-120.50`) are preserved.
 4. **Mandatory Field Validation:**
-   - Every patient record must have a non-empty `patient_id` and a valid `last_modified` timestamp. Records missing either field are rejected and logged.
+   - Every patient record must contain a non-empty `patient_id` and a valid `last_modified` timestamp. Records missing either field are quarantined and logged.
 5. **Deduplication Logic:**
    - When duplicate `patient_id` values appear across the export, records are grouped together. The engine compares their `last_modified` timestamps and deterministically retains only the latest update, safely discarding stale entries.
 
 ---
 
-## 3. Handling the Malformed CSV Export Row (`1,250.00`)
+## 3. Malformed CSV Row Recovery (`1,250.00`)
 
-During our initial ingestion audit, we detected a critical formatting error in your legacy CSV export:
-- In row 12 (patient `P009`), the balance value `1,250.00` was emitted **without double quotation marks**.
-- **The Issue:** Because standard comma-separated values (CSV) use commas as column delimiters, an unquoted comma inside a numeric literal splits `1` and `250.00` into two separate fields. This shifts all subsequent columns to the right, causing downstream systems to assign timestamp values to balance fields or crash due to unexpected column counts (9 columns instead of 8).
-- **Our Handling:** Rather than silently misaligning data into incorrect fields, our parser detects the column mismatch, logs a high-priority warning citing the unquoted currency issue, and rejects the malformed row to preserve downstream clinical database integrity.
-- **Reference Fix:** We have provided a validated sample in `data/patients_corrected.csv` showing the properly escaped format (`"1,250.00"`).
+In the sample dataset, patient row `P-1002` (Jane Smith) contained an account balance `1,250.00` exported **without enclosing double quotes**.
+- **The Problem:** Because standard comma-separated values (CSV) use commas as column delimiters, an unquoted comma inside a numeric literal splits `1` and `250.00` into two separate fields. This creates an extra column (9 columns instead of the expected 8), which causes naive parsers to shift timestamp values into balance fields or crash.
+- **Our Safe Recovery Logic:** Rather than immediately dropping the row or blindly guessing, our parser applies a safe recovery heuristic:
+  1. It verifies that the row has exactly one additional column (`len(row) == 9`).
+  2. It verifies that the final column is a valid, parseable `last_modified` timestamp.
+  3. It reconstructs the split balance tokens (`1` and `250.00`) into `1,250.00` and validates that it parses to numeric `1250.00`.
+  4. It validates all other fields (`patient_id`, `dob`, contact fields).
+  - If all checks succeed, the record is safely recovered and normalized.
+  - If any condition is ambiguous or validation fails, the record is quarantined to prevent corrupt clinical data from propagating.
 
 ---
 
 ## 4. API Resilience, Batching, and Fault Tolerance
 
-Outbound communication with `POST /v1/patients` incorporates enterprise-grade reliability patterns:
+The API integration layer (`src/api_client.py`) incorporates enterprise reliability patterns (validated using automated mock HTTP test harnesses):
 
-1. **Chunked Batching:** Records are batched into chunks of up to 100 patients per HTTP request (`BATCH_SIZE=100`), reducing network round trips and server overhead.
-2. **Sliding-Window Rate Limiter:** An automated sliding-window rate limiter prevents API throttling by capping requests at a maximum of **5 requests per second**.
+1. **Chunked Batching:** Records are batched into chunks of up to 100 patients per request (`BATCH_SIZE=100`), reducing network overhead.
+2. **Absolute Rate Limiting:** Outbound traffic is strictly governed by a sliding-window rate limiter enforcing a hard ceiling of **at most 5 requests per second**, even if higher rates are configured.
 3. **Exponential Backoff & Retries:**
    - Transient server errors (**HTTP 5xx**), rate-limit events (**HTTP 429**), and network timeouts are automatically retried with exponential backoff and random jitter (`delay = initial_backoff * 2^(attempt-1) + jitter`).
-   - If the API returns a `Retry-After` header during an HTTP 429 event, our client dynamically respects that server-specified window.
+   - `MAX_RETRIES` specifies the maximum number of retry attempts following an initial failed request (e.g., `MAX_RETRIES=3` performs 1 initial attempt + up to 3 retries, totaling up to 4 attempts).
+   - If an HTTP 429 response includes a `Retry-After` header, the client dynamically respects that duration.
 4. **Isolated HTTP 400 Bad Request Handling:**
-   - Client-side validation errors (**HTTP 400**) represent payload-specific defects and are non-retriable.
-   - Instead of aborting the ingestion job, the affected batch is immediately isolated and persisted into `failed_records.json` with comprehensive diagnostic metadata (timestamp, HTTP status code, API error message, and original record payload).
-   - Ingestion then continues uninterrupted for all subsequent batches.
+   - Client-side validation errors (**HTTP 400**) represent non-retriable payload defects.
+   - The affected batch is immediately isolated and persisted into `failed_records.json` with diagnostic metadata (timestamp, HTTP status, server error message, and original record payload).
+   - Ingestion proceeds uninterrupted for subsequent batches.
 5. **Credential Security:**
    - Authorization tokens are injected via the `API_TOKEN` environment variable and passed as standard `Bearer` tokens. All logging layers automatically mask secret values (e.g., `mo****-xyz`), ensuring credentials are never exposed in logs or monitoring systems.
 
@@ -113,25 +120,22 @@ Outbound communication with `POST /v1/patients` incorporates enterprise-grade re
 
 ## 5. Recommended Upstream Improvement
 
-To prevent data rejections before ingestion occurs, we recommend the following upstream enhancement to your database export routines:
+To prevent data corruption at the source and eliminate the need for downstream heuristic recovery, we recommend the following upstream enhancement:
 
-> **Recommendation:** Update the legacy export stored procedure or script to strictly comply with **RFC 4180 CSV specifications**.
+> **Recommendation:** Update the legacy export script or database query to strictly adhere to **RFC 4180 CSV specifications**.
 >
-> 1. **Quote Delimiter-Containing Fields:** Ensure that all string or numeric fields containing commas, currency characters, or quotes are enclosed in standard double quotes (e.g., `"1,250.00"` instead of `1,250.00`).
-> 2. **Native ISO 8601 Dates:** Configure the export service to format all dates as `YYYY-MM-DD` and timestamps as UTC ISO 8601 strings (`YYYY-MM-DDTHH:MM:SSZ`) at extraction time.
+> 1. **Enclose Delimiter-Containing Fields in Quotes:** Ensure that all fields containing commas, currency characters, or quotes are wrapped in double quotes (e.g., `"1,250.00"` instead of `1,250.00`).
+> 2. **Standardize Date Formats at Extraction:** Configure the export routine to emit all dates of birth in ISO 8601 format (`YYYY-MM-DD`) and timestamps in UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`).
 
-Adopting RFC 4180-compliant serialization upstream will eliminate column-shifting anomalies and maximize automated processing rates across all integration pipelines.
+Implementing RFC 4180 compliance upstream will ensure zero column-alignment anomalies and maximize automated ingestion throughput.
 
 ---
 
 ## 6. Support and Handover
 
-All unit and integration test suites are passing with 100% test success across all edge cases. The complete codebase, Docker configuration, and documentation have been placed in the repository.
-
-Please let us know if your infrastructure team requires any assistance during the staging rollout.
+The complete codebase, Docker configuration, and automated test suite have been placed in the repository. Please let us know if your team needs any assistance during deployment.
 
 Warm regards,
 
-**Senior Backend & DevOps Engineering Team**  
-SHC Technologies Pvt. Ltd.  
-`engineering@shc-technologies.com`
+**Forward Deployed Engineering Team**  
+SHC Technologies Pvt. Ltd.

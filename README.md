@@ -3,25 +3,25 @@
 [![Python Version](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Tests: Pytest](https://img.shields.io/badge/tests-33%20passed-brightgreen.svg)](https://docs.pytest.org/)
+[![Tests: Pytest](https://img.shields.io/badge/tests-36%20passed-brightgreen.svg)](https://docs.pytest.org/)
 
-Production-ready Forward Deployed Engineer (FDE) integration pipeline for extracting, sanitizing, deduplicating, and securely transmitting legacy healthcare records into modern REST platforms. Built for GlobalHealth Corp integration by SHC Technologies Pvt. Ltd.
+Production-grade Forward Deployed Engineer (FDE) integration pipeline for extracting, sanitizing, deduplicating, and securely transmitting legacy healthcare records into modern REST platforms. Built for GlobalHealth Corp integration by SHC Technologies Pvt. Ltd.
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
-2. [Business Problem & Solution](#2-business-problem--solution)
+2. [Datasets Provided](#2-datasets-provided)
 3. [Architecture & Data Flow](#3-architecture--data-flow)
 4. [Technology Stack](#4-technology-stack)
 5. [Folder Structure](#5-folder-structure)
-6. [CSV Normalization Approach](#6-csv-normalization-approach)
+6. [CSV Normalization & Malformed Row Recovery](#6-csv-normalization--malformed-row-recovery)
 7. [Date Parsing Logic & Supported Formats](#7-date-parsing-logic--supported-formats)
 8. [Duplicate Record Handling](#8-duplicate-record-handling)
 9. [API Authentication & Integration](#9-api-authentication--integration)
-10. [Batch Processing & Rate Limiting](#10-batch-processing--rate-limiting)
-11. [Exponential Backoff Implementation](#11-exponential-backoff-implementation)
+10. [Batch Processing & Absolute Rate Limiting](#10-batch-processing--absolute-rate-limiting)
+11. [Exponential Backoff & Retry Logic](#11-exponential-backoff--retry-logic)
 12. [Error Handling & Failure Isolation](#12-error-handling--failure-isolation)
 13. [Environment Configuration](#13-environment-configuration)
 14. [Local Setup Instructions](#14-local-setup-instructions)
@@ -33,24 +33,32 @@ Production-ready Forward Deployed Engineer (FDE) integration pipeline for extrac
 
 ## 1. Project Overview
 
-The **SHC Patient Data Ingestion Engine** is a high-reliability, fault-tolerant Extract-Transform-Load (ETL) and API integration service. It ingests legacy Electronic Health Record (EHR) CSV dumps from partner hospital networks, resolves pervasive data quality anomalies (mixed date encodings, international currency signs, unquoted delimiters, duplicate updates), and transmits validated records in batched, rate-governed transactions to upstream healthcare API endpoints.
+The **SHC Patient Data Ingestion Engine** is a high-reliability, fault-tolerant Extract-Transform-Load (ETL) and API integration service. It ingests legacy Electronic Health Record (EHR) CSV dumps, resolves data quality anomalies (mixed date encodings, international currency signs, unquoted delimiters, duplicate updates), and prepares validated records for batched, rate-governed transmission to upstream healthcare API endpoints.
+
+> **Note on API Target:** The endpoint `https://api.mock-shc.com/v1/patients` is a mock specification URL. All networking behavior, rate limiting, and retry handling have been verified using automated mock HTTP test harnesses.
 
 ---
 
-## 2. Business Problem & Solution
+## 2. Datasets Provided
 
-### The Business Challenge
-Healthcare data exchanges frequently encounter legacy data exports characterized by:
-- **Syntactic Corruption:** Incomplete quoting of currency values containing commas (e.g. `1,250.00` emitted without RFC 4180 quotes), which fragments CSV rows into incorrect column alignments.
-- **Heterogeneous Date Encodings:** Inconsistent date representations across facilities (`MM/DD/YYYY`, `DD-MM-YYYY`, `YYYY-MM-DD`).
-- **Currency & Accounting Variances:** Mixtures of `$`, `€`, `₹`, `£`, commas, and accounting parentheses representing negative balances (`($120.50)`).
-- **Duplicate & Out-of-Order Updates:** Multiple records for the same patient across time.
-- **Strict Target API Quotas:** Strict rate limits (5 req/sec), payload limits (100 records/batch), and transient server errors (HTTP 429, 5xx) requiring resilient backoff.
+The project includes three dataset files under the `data/` directory:
 
-### The Solution
-A decoupled, two-phase pipeline:
-1. **Extraction & Normalization Engine (`src/cleaner.py`):** Parses raw CSV data, detects and rejects malformed rows to prevent downstream database pollution, standardizes fields to ISO 8601, cleans currency to IEEE floating-point numbers, and deduplicates patient records by their latest update timestamp.
-2. **Resilient API Transmission Engine (`src/api_client.py`):** Partitions cleaned data into chunks of 100, governs transmission with a 5 req/sec sliding-window rate limiter, retries 429/5xx errors using jittered exponential backoff, and isolates non-retriable 400 Bad Request batches into `failed_records.json` without aborting the pipeline.
+1. **`data/patients_shc_sample.csv` (Original Assessment Sample):**
+   The exact 9-row dataset provided in page 2 of the official SHC technical assessment task PDF. It features:
+   - Duplicate updates for `P-1001` and `P-1003` with different timestamps.
+   - Malformed unquoted account balance `1,250.00` for patient `P-1002`.
+   - Various date formats (`YYYY-MM-DD`, `MM/DD/YYYY`, `DD-MM-YYYY`).
+   - Currency formats (`$150.50`, `€300.00`, `0.00`, `"2,450.75"`, `$-15.00`).
+   - Missing email (`P-1002`, `P-1005`) and missing phone (`P-1002`, `P-1006`).
+
+2. **`data/patients.csv` (Comprehensive Demonstration Dataset):**
+   An expanded 15-row dataset covering additional real-world edge cases:
+   - Accounting negative balances: `($120.50)`
+   - Indian Rupee currency: `₹15000.00`
+   - Quarantined invalid records: Missing mandatory `patient_id`, missing `last_modified`, invalid calendar date (`1985-02-31`), and non-numeric account balance (`NOT_A_NUMBER`).
+
+3. **`data/patients_corrected.csv` (RFC 4180 Reference Dataset):**
+   A reference version of the demonstration data where the unquoted `1,250.00` is properly enclosed in quotes as `"1,250.00"`.
 
 ---
 
@@ -61,80 +69,36 @@ A decoupled, two-phase pipeline:
 ```mermaid
 flowchart TD
     subgraph Storage [Host File System / Volume]
-        RawCSV[data/patients.csv]
+        SampleCSV[data/patients_shc_sample.csv]
+        DemoCSV[data/patients.csv]
         CleanCSV[data/cleaned_patients.csv]
         FailedJSON[failed_records.json]
     end
 
     subgraph Container [Dockerized Ingestion Engine]
         Main[src.main CLI Orchestrator]
-        Cleaner[src.cleaner: Data Cleaning & Deduplication]
-        Limiter[RateLimiter: 5 req/sec Sliding Window]
+        Cleaner[src.cleaner: Recovery, Normalization & Deduplication]
+        Limiter[RateLimiter: Hard-Capped <= 5.0 req/sec]
         Client[src.api_client: Fault-Tolerant REST Client]
     end
 
-    subgraph API [SHC Cloud Platform]
+    subgraph API [SHC Platform Endpoint]
         MockAPI[POST /v1/patients]
     end
 
-    RawCSV -->|Read Raw Records| Cleaner
-    Cleaner -->|Diagnose Malformed & Deduplicate| Cleaner
-    Cleaner -->|Write Clean Records| CleanCSV
+    SampleCSV -->|Read Records| Cleaner
+    DemoCSV -.->|Alternative Dataset| Cleaner
+    Cleaner -->|Reconstruct Unquoted Comma or Quarantine| Cleaner
+    Cleaner -->|Write Normalized Records| CleanCSV
     Cleaner -->|Clean PatientRecord List| Main
     Main -->|Send Batches <= 100| Client
-    Client <-->|Token Throttle| Limiter
+    Client <-->|Token Throttle <= 5 req/s| Limiter
     Client -->|HTTP POST with Bearer Token| MockAPI
     MockAPI -->|200 OK / 201 Created| Client
     MockAPI -->|429 / 5xx / Timeout| Client
-    Client -->|Exponential Backoff & Retry| MockAPI
+    Client -->|Exponential Backoff & Retries| MockAPI
     MockAPI -->|400 Bad Request| Client
     Client -->|Isolate Non-Retriable Bad Batches| FailedJSON
-```
-
-### Data Processing Flow
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Operator as DevOps / Cron
-    participant Main as src.main
-    participant Cleaner as src.cleaner
-    participant Client as src.api_client
-    participant API as POST /v1/patients
-    participant Disk as Local Storage
-
-    Operator->>Main: Execute pipeline (CLI / Docker)
-    Main->>Cleaner: read_and_clean_patient_data('data/patients.csv')
-    Cleaner->>Cleaner: Validate headers & row column counts
-    Note over Cleaner: Reject unquoted commas ('1,250.00') & corrupt rows
-    Cleaner->>Cleaner: Normalize DOB to YYYY-MM-DD
-    Cleaner->>Cleaner: Normalize currency ($, €, ₹) to float
-    Cleaner->>Cleaner: Group by patient_id & keep latest last_modified
-    Cleaner->>Disk: Write data/cleaned_patients.csv
-    Cleaner-->>Main: Return cleaned records + CleaningReport
-
-    Main->>Client: ingest_all(records)
-    Client->>Client: Chunk records into batches of 100
-    loop For each batch of 100
-        Client->>Client: Acquire token from RateLimiter (max 5/sec)
-        Client->>API: POST /v1/patients (Authorization: Bearer ****)
-        alt Response 200/201 Success
-            API-->>Client: 200 OK
-            Client->>Client: Log success & record metrics
-        else Response 429 Too Many Requests
-            API-->>Client: 429 (Retry-After: N)
-            Client->>Client: Exponential backoff + sleep(N) & retry
-        else Response 5xx Server Error
-            API-->>Client: 500/502/503/504
-            Client->>Client: Exponential backoff with jitter & retry
-        else Response 400 Bad Request
-            API-->>Client: 400 Client Error
-            Client->>Disk: Append batch to failed_records.json
-            Note over Client: Continue processing next batch!
-        end
-    end
-    Client-->>Main: IngestionSummary
-    Main->>Operator: Log structured run report (Exit code 0)
 ```
 
 ---
@@ -156,23 +120,25 @@ sequenceDiagram
 shc-patient-data-ingestion/
 │
 ├── data/
-│   ├── patients.csv              # Raw sample dataset with real-world edge cases
-│   ├── patients_corrected.csv    # Reference RFC 4180 corrected dataset
+│   ├── patients_shc_sample.csv   # Exact sample dataset from SHC assessment PDF
+│   ├── patients.csv              # Comprehensive demonstration dataset
+│   ├── patients_corrected.csv    # Reference RFC 4180 compliant dataset
 │   └── cleaned_patients.csv      # Cleaned, normalized, deduplicated output
 │
 ├── src/
 │   ├── __init__.py               # Package metadata and version definition
-│   ├── cleaner.py                # Task 1: Extraction, normalization, and deduplication
-│   ├── api_client.py             # Task 2: Rate limiter, retry engine, and REST client
+│   ├── cleaner.py                # Task 1: Extraction, normalization, safe recovery & deduplication
+│   ├── api_client.py             # Task 2: Rate limiter (<=5 req/s), retry engine, REST client
 │   └── main.py                   # Orchestrator CLI entrypoint
 │
 ├── tests/
 │   ├── __init__.py               # Test package initialization
-│   ├── test_cleaner.py           # Unit tests for date parsing, currency, and deduplication
-│   ├── test_api_client.py        # Unit tests for rate limiting, retries, and HTTP 400 handling
+│   ├── test_cleaner.py           # Unit tests for Task 1 (DOB, currency, recovery, deduplication)
+│   ├── test_api_client.py        # Unit tests for Task 2 (hard cap, batching, 400 isolation, retries)
 │   └── test_main.py              # End-to-end integration tests with mocked API
 │
-├── failed_records.json           # Isolated records from HTTP 400 / exhausted attempts
+├── failed_records.json           # Isolated storage for non-retriable HTTP 400 / exhausted attempts
+├── dashboard.html                # Interactive HTML data quality dashboard
 ├── Dockerfile                    # Production multi-stage Docker build
 ├── requirements.txt              # Production and testing Python dependencies
 ├── .env.example                  # Environment template without secrets
@@ -185,21 +151,25 @@ shc-patient-data-ingestion/
 
 ---
 
-## 6. CSV Normalization Approach
+## 6. CSV Normalization & Malformed Row Recovery
 
-The extraction engine operates line-by-line using Python’s standard `csv` module to prevent memory bottlenecks on large dumps:
+### The Malformed Row Problem
+In the sample CSV, row `P-1002` contains:
+```text
+P-1002,Jane,Smith,12/31/1992,,,1,250.00,2026-10-02T11:30:00Z
+```
+Because `1,250.00` is unquoted, a standard CSV reader splits the line on the comma, resulting in 9 columns instead of the expected 8:
+- Column 6: `1`
+- Column 7: `250.00`
+- Column 8: `2026-10-02T11:30:00Z`
 
-1. **Header Validation:** Enforces the presence of mandatory columns (`patient_id`, `last_modified`).
-2. **Missing Contact Data:** Missing `email` and `phone` values are normalized to empty strings (`""`) without crashing.
-3. **The Malformed Row Issue (`1,250.00`):**
-   - In raw CSV exports, if an account balance such as `1,250.00` is unquoted, standard CSV readers split it across the comma into two columns (`1` and `250.00`), creating 9 columns instead of the expected 8.
-   - Naive parsers either crash or shift subsequent columns, misassigning values.
-   - **Our Handling:** `src/cleaner.py` compares row length with expected column count. When a 9-column row with an unquoted currency comma is detected, it logs a clear RFC 4180 explanation and rejects the corrupt record to prevent silent data corruption.
-4. **Currency Standardization:**
-   - Strips `$`, `€`, `₹`, and `£`.
-   - Strips thousands commas (e.g. `1,250.00` &rarr; `1250.00`).
-   - Retains negative signs (`-$50.00`, `-50.00`) and converts accounting parentheses (`($120.50)` &rarr; `-120.50`).
-   - Converts to standard Python `float` rounded to two decimal places.
+### Safe Recovery Heuristic
+`src/cleaner.py` contains a recovery routine (`attempt_recover_malformed_balance_row`):
+1. **Column Count Check:** The row must have exactly one extra column (`len(row) == len(headers) + 1`).
+2. **Timestamp Verification:** The final field (`row[-1]`) must parse as a valid ISO `last_modified` timestamp.
+3. **Balance Reconstruction:** The split tokens at the `account_balance` column index are joined with `,` (e.g. `1,250.00`) and validated as a valid numeric float (`1250.00`).
+4. **Full Field Validation:** Every reconstructed field is validated (`patient_id` non-empty, `dob` valid date).
+5. **Ambiguity Defense:** If any check fails or the row structure is ambiguous, the record is **quarantined** rather than guessed, preventing corrupt clinical data from propagating.
 
 ---
 
@@ -207,185 +177,117 @@ The extraction engine operates line-by-line using Python’s standard `csv` modu
 
 Dates of birth (`dob`) are normalized to **ISO 8601** format (`YYYY-MM-DD`):
 
-| Input Format | Regex Pattern | Input Sample | Normalized Output |
+| Input Format | Sample Input | Normalized Output | Description |
 | :--- | :--- | :--- | :--- |
-| **YYYY-MM-DD** | `^\d{4}-\d{1,2}-\d{1,2}$` | `1990-11-23` | `1990-11-23` |
-| **MM/DD/YYYY** | `^\d{1,2}/\d{1,2}/\d{4}$` | `04/15/1985` | `1985-04-15` |
-| **DD-MM-YYYY** | `^\d{1,2}-\d{1,2}-\d{4}$` | `23-08-1976` | `1976-08-23` |
+| **YYYY-MM-DD** | `1980-05-15` | `1980-05-15` | Standard ISO 8601 date |
+| **MM/DD/YYYY** | `12/31/1992` | `1992-12-31` | US legacy format |
+| **DD-MM-YYYY** | `25-04-1975` | `1975-04-25` | European legacy format |
 
-Invalid calendar dates (e.g., `1985-02-31` or `31-04-2000`) are detected using Python calendar validation, logged with the exact reason, and safely rejected.
+Invalid dates (such as `1985-02-31`) are caught by calendar validation and quarantined.
 
 ---
 
 ## 8. Duplicate Record Handling
 
-When multiple updates exist for the same `patient_id`:
+When duplicate `patient_id` entries occur:
 1. Records are grouped by `patient_id`.
-2. Each record's `last_modified` timestamp is parsed into a timezone-aware UTC `datetime` object.
-3. The records are sorted in descending order of `last_modified`.
-4. The record with the latest timestamp is retained; older records are discarded.
-5. Deduplication metrics are logged (kept timestamp vs. discarded count).
+2. Their `last_modified` timestamps are parsed into timezone-aware UTC `datetime` objects.
+3. Records are sorted in descending order of `last_modified`.
+4. The record with the latest timestamp is retained; older revisions are pruned.
+5. In the assessment sample:
+   - `P-1001`: Record from `2026-10-05T14:20:00Z` is kept; record from `2026-09-28T08:00:00Z` is retired.
+   - `P-1003`: Record from `2026-10-03T09:15:00Z` is kept; record from `2026-09-20T10:00:00Z` is retired.
 
 ---
 
 ## 9. API Authentication & Integration
 
 - **Endpoint:** `POST https://api.mock-shc.com/v1/patients` (configurable via `API_BASE_URL`).
-- **Authentication:** HTTP Authorization header: `Authorization: Bearer <API_TOKEN>`.
-- **Credential Masking:** Tokens are strictly redacted in log output (e.g., `mo****-xyz`), ensuring compliance with HIPAA, SOC 2, and ISO 27001 auditing standards.
+- **Authentication:** `Authorization: Bearer <API_TOKEN>`.
+- **Credential Masking:** Secret tokens are masked in all logs (e.g. `mo****-xyz`), ensuring compliance with security standards.
 
 ---
 
-## 10. Batch Processing & Rate Limiting
+## 10. Batch Processing & Absolute Rate Limiting
 
-- **Batching:** `chunk_records()` groups normalized records into batches of up to 100 items (`BATCH_SIZE=100`).
-- **Rate Limiting:** `RateLimiter` implements a sliding-window algorithm that measures request timestamps over a 1.0-second rolling interval. If 5 requests have been dispatched within the current window, subsequent requests are automatically throttled, strictly guaranteeing that outbound traffic **never exceeds 5 requests per second**.
+- **Batching:** `chunk_records()` partitions patient arrays into batches of up to 100 records (`BATCH_SIZE=100`).
+- **Hard Rate Limit:** The `RateLimiter` enforces an **absolute ceiling of at most 5.0 requests per second** using a sliding-window tracker. Even if `RATE_LIMIT_RPS` is set to a higher value (e.g. `10` or `50`), the rate limiter clamps execution to `5.0 req/s`.
 
 ---
 
-## 11. Exponential Backoff Implementation
+## 11. Exponential Backoff & Retry Logic
 
-For transient errors, the client calculates backoff with uniform random jitter to avoid thundering-herd conditions:
-
-$$\text{delay} = \min\left(\text{max\_delay},\ \text{initial\_backoff} \times \text{backoff\_factor}^{(\text{attempt} - 1)}\right) + \text{jitter}$$
-
-- **HTTP 429 (Too Many Requests):** If the response includes a `Retry-After` header, that value is honored; otherwise, exponential backoff is applied.
-- **HTTP 5xx (Server Errors) & Timeouts:** Automatically retried up to `MAX_RETRIES` (default: 3).
+- **Transient Errors:** Retried on HTTP 429, HTTP 5xx, and network timeouts.
+- **Backoff Formula:** $\text{delay} = \min(\text{max\_delay},\ \text{initial\_backoff} \times \text{backoff\_factor}^{(\text{attempt} - 1)}) + \text{jitter}$
+- **Retry Count Definition:** `MAX_RETRIES` represents the number of retry attempts *after* an initial failure. For example, with `MAX_RETRIES=3`, the client will make 1 initial request and up to 3 retries (total 4 attempts) before isolating the batch.
+- **Retry-After Header:** Dynamically honored if returned on HTTP 429.
 
 ---
 
 ## 12. Error Handling & Failure Isolation
 
-### HTTP 400 Bad Request
-HTTP 400 indicates an invalid payload that will not succeed upon retry. The client:
-1. Logs the HTTP 400 error and server message.
-2. Extracts the failing batch.
-3. Appends the batch, timestamp, status code, and payload to `failed_records.json`.
-4. **Continues execution:** Ingestion proceeds with the remaining batches.
-
-### Network Timeouts & Exhausted Retries
-If retries are exhausted without receiving a 2xx response, the batch is appended to `failed_records.json` with error type `RETRIES_EXHAUSTED`, and a detailed warning is emitted.
+- **HTTP 400 Bad Request:** Non-retriable. The failing batch is isolated into `failed_records.json` with timestamp, status code, error detail, and record payload. Ingestion continues for subsequent batches.
+- **Retries Exhausted:** Recorded into `failed_records.json` with error type `RETRIES_EXHAUSTED`.
 
 ---
 
 ## 13. Environment Configuration
 
-All settings are configured through environment variables or a `.env` file:
-
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
 | `API_BASE_URL` | `https://api.mock-shc.com/v1/patients` | Target REST API endpoint |
 | `API_TOKEN` | `""` | Bearer authentication token |
-| `INPUT_FILE` | `data/patients.csv` | Path to raw patient CSV |
-| `OUTPUT_FILE` | `data/cleaned_patients.csv` | Path to save cleaned CSV |
-| `FAILED_RECORDS_FILE` | `failed_records.json` | Path to store failed 400/retried records |
+| `INPUT_FILE` | `data/patients_shc_sample.csv` | Input CSV path |
+| `OUTPUT_FILE` | `data/cleaned_patients.csv` | Cleaned CSV path |
+| `FAILED_RECORDS_FILE` | `failed_records.json` | Failed records JSON path |
 | `BATCH_SIZE` | `100` | Maximum records per API request |
-| `MAX_RETRIES` | `3` | Maximum retry attempts for 429/5xx/network errors |
-| `RATE_LIMIT_RPS` | `5.0` | Maximum allowed requests per second |
-| `INITIAL_BACKOFF` | `1.0` | Initial exponential backoff delay in seconds |
-| `BACKOFF_FACTOR` | `2.0` | Multiplier for exponential backoff |
-| `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `MAX_RETRIES` | `3` | Maximum retry attempts after initial failure |
+| `RATE_LIMIT_RPS` | `5.0` | Desired requests/sec (strictly capped at 5.0) |
+| `LOG_LEVEL` | `INFO` | Console logging verbosity |
 
 ---
 
 ## 14. Local Setup Instructions
 
-### Prerequisites
-- Python 3.12+
-- `pip` or `uv`
-
-### Installation
 ```bash
-# Clone the repository
-git clone https://github.com/shc-technologies/shc-patient-data-ingestion.git
-cd shc-patient-data-ingestion
+# 1. Activate virtual environment
+.\.venv\Scripts\Activate.ps1   # Windows PowerShell
+source .venv/bin/activate       # Linux/macOS
 
-# Create and activate virtual environment
-python -m venv .venv
+# 2. Run extraction on original SHC sample:
+python -m src.main --input data/patients_shc_sample.csv --dry-run
 
-# On Linux/macOS:
-source .venv/bin/activate
-# On Windows PowerShell:
-.\.venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy environment template
-cp .env.example .env
-```
-
-### Execution
-```bash
-# Run data extraction & cleaning only (dry-run):
-python -m src.main --dry-run
-
-# Run full pipeline with API transmission:
-python -m src.main
-
-# Run with custom input and output paths:
-python -m src.main --input data/patients_corrected.csv --output data/cleaned_patients.csv
+# 3. Run extraction on demonstration dataset:
+python -m src.main --input data/patients.csv --dry-run
 ```
 
 ---
 
 ## 15. Docker Build & Execution Commands
 
-### Build Image
 ```bash
+# Build production Docker image
 docker build -t shc-patient-ingestion:1.0.0 .
-```
 
-### Run Container
-```bash
-# Using volume mount for persistent input/output:
-docker run --rm \
-  -e API_BASE_URL="https://api.mock-shc.com/v1/patients" \
-  -e API_TOKEN="your-secure-bearer-token" \
-  -v $(pwd)/data:/app/data \
-  shc-patient-ingestion:1.0.0
-
-# Using .env file:
-docker run --rm \
-  --env-file .env \
-  -v $(pwd)/data:/app/data \
-  shc-patient-ingestion:1.0.0
-
-# Running dry-run mode inside Docker:
-docker run --rm \
-  -v $(pwd)/data:/app/data \
-  shc-patient-ingestion:1.0.0 --dry-run
+# Run container with volume mount in dry-run mode
+docker run --rm -v $(pwd)/data:/app/data shc-patient-ingestion:1.0.0 --dry-run
 ```
 
 ---
 
 ## 16. Testing Instructions
 
-The test suite provides comprehensive coverage of all data edge cases, rate limiting, and mock API interactions:
-
 ```bash
 # Run complete test suite:
 pytest -v
-
-# Run with coverage report:
-pytest -v --cov=src --cov-report=term-missing
 ```
 
-### Test Coverage Summary
-- **DOB Normalization:** `YYYY-MM-DD`, `MM/DD/YYYY`, `DD-MM-YYYY`, single-digit components, invalid dates (Feb 31, April 31).
-- **Currency & Balance:** `$`, `€`, `₹`, `£`, commas, negative balances, accounting parentheses `($120.50)`.
-- **Deduplication:** Grouping by `patient_id`, preserving latest `last_modified` timestamp.
-- **Malformed Rows:** Detection of unquoted commas splitting `1,250.00` into 9 columns.
-- **API Batching:** Chunking into batches of 100.
-- **Rate Limiting:** Enforcing maximum 5 requests per second.
-- **Retry Handling:** HTTP 429 with `Retry-After`, HTTP 5xx with exponential backoff, connection timeouts.
-- **Failure Isolation:** Non-retriable HTTP 400 batches saved to `failed_records.json` while subsequent batches continue.
+All 36 tests cover date normalization, currency parsing, malformed unquoted comma recovery, ambiguous record quarantine, duplicate deduplication, rate limit hard-capping, exponential backoff, and mock API integration.
 
 ---
 
 ## 17. Assumptions & Limitations
 
-1. **Date Ambiguity:** Date components are resolved based on delimiters: `/` indicates `MM/DD/YYYY` (US standard), while `-` with two leading digits indicates `DD-MM-YYYY` (European standard), and four leading digits indicates `YYYY-MM-DD` (ISO 8601).
+1. **Date Ambiguity:** Resolved by separator: `/` indicates `MM/DD/YYYY`, `-` with two leading digits indicates `DD-MM-YYYY`, and `-` with four leading digits indicates `YYYY-MM-DD`.
 2. **Missing Contacts:** In line with healthcare workflows, patients without recorded emails or phone numbers remain valid clinical entities; their contact fields are populated with empty strings.
-3. **Mock API Verification:** The target endpoint `https://api.mock-shc.com/v1/patients` is a mock specification URL. The application explicitly tracks real HTTP responses and will never claim records have been uploaded unless an HTTP 2xx status code is verified.
-4. **RFC 4180 Upstream Standard:** Upstream CSV extractors should wrap fields containing commas in double quotation marks to prevent malformed rows.
+3. **Mock API:** The target endpoint is a mock specification URL. Network interactions are validated via automated mock tests.

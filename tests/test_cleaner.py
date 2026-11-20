@@ -79,6 +79,7 @@ class TestAccountBalanceParsing:
         assert parse_account_balance("-50.00") == -50.00
         assert parse_account_balance("-$50.00") == -50.00
         assert parse_account_balance("$-50.00") == -50.00
+        assert parse_account_balance("$-15.00") == -15.00
         assert parse_account_balance("-€75.25") == -75.25
         assert parse_account_balance("-₹500.00") == -500.00
 
@@ -120,38 +121,78 @@ class TestTimestampParsing:
 class TestPatientDataIngestionAndDeduplication:
     """Test suite for CSV ingestion, validation, and deduplication logic."""
 
-    def test_read_sample_csv_with_all_cases(self, tmp_path: Path) -> None:
+    def test_recover_unquoted_comma_balance_exact_sample(self, tmp_path: Path) -> None:
+        """Verify safe recovery of malformed unquoted 1,250.00 row to float 1250.00."""
         csv_content = (
-            "patient_id,first_name,last_name,email,phone,dob,account_balance,last_modified\n"
-            "P001,John,Doe,john@example.com,555-0101,04/15/1985,$150.00,2023-10-01T10:00:00Z\n"
-            "P001,John,Doe,john@example.com,555-0101,04/15/1985,$200.50,2023-11-15T14:30:00Z\n"
-            "P002,Jane,Smith,,555-0102,1990-11-23,€350.75,2023-10-05T08:15:00Z\n"
-            "P003,Robert,Johnson,robert@example.com,,23-08-1976,₹15000.00,2024-01-05T09:00:00Z\n"
-            "P004,Emily,Davis,,,12/30/1995,-$50.00,2023-11-20T16:45:00Z\n"
-            'P006,Sarah,Wilson,sarah@example.com,555-0106,07-04-1988,"1,250.00",2023-12-10T15:00:00Z\n'
-            "P009,Frank,Miller,frank@example.com,555-0109,1983-07-22,1,250.00,2023-12-05T11:00:00Z\n"
-            ",Missing,ID,missing@example.com,555-0000,1990-01-01,100.00,2023-12-01T10:00:00Z\n"
-            "P011,David,NoTimestamp,david@example.com,555-0111,1988-03-15,$250.00,\n"
-            "P012,Eva,BadDate,eva@example.com,555-0112,1985-02-31,$300.00,2023-12-01T10:00:00Z\n"
+            "patient_id,first_name,last_name,dob,email,phone,account_balance,last_modified\n"
+            "P-1002,Jane,Smith,12/31/1992,,,1,250.00,2026-10-02T11:30:00Z\n"
         )
-        test_file = tmp_path / "test_patients.csv"
+        test_file = tmp_path / "malformed_balance.csv"
         test_file.write_text(csv_content, encoding="utf-8")
 
         records, report = read_and_clean_patient_data(test_file)
 
-        # Total rows read: 10
-        assert report.total_rows_read == 10
-        # P009 has unquoted 1,250.00 resulting in 9 columns -> rejected as malformed
+        assert report.total_rows_read == 1
+        assert report.malformed_rows_recovered == 1
+        assert report.malformed_rows_rejected == 0
+        assert len(records) == 1
+
+        recovered = records[0]
+        assert recovered.patient_id == "P-1002"
+        assert recovered.first_name == "Jane"
+        assert recovered.last_name == "Smith"
+        assert recovered.dob == "1992-12-31"
+        assert recovered.email == ""
+        assert recovered.phone == ""
+        # Strictly verify that account balance became 1250.00 float
+        assert recovered.account_balance == 1250.00
+        assert recovered.last_modified == "2026-10-02T11:30:00+00:00"
+
+    def test_ambiguous_malformed_row_quarantined_not_guessed(self, tmp_path: Path) -> None:
+        """Verify that when recovery is ambiguous (e.g. invalid final timestamp), record is quarantined."""
+        csv_content = (
+            "patient_id,first_name,last_name,dob,email,phone,account_balance,last_modified\n"
+            "P-9999,Bad,Row,1990-01-01,bad@example.com,555-0000,1,250.00,NOT_A_TIMESTAMP\n"
+        )
+        test_file = tmp_path / "ambiguous.csv"
+        test_file.write_text(csv_content, encoding="utf-8")
+
+        records, report = read_and_clean_patient_data(test_file)
+
+        assert report.total_rows_read == 1
+        assert report.malformed_rows_recovered == 0
         assert report.malformed_rows_rejected == 1
-        # Missing ID, missing timestamp, bad date (Feb 31) -> 3 rejected
-        assert report.invalid_records_rejected == 3
-        # Valid records parsed: P001 (x2), P002, P003, P004, P006 = 6
-        assert report.valid_records_parsed == 6
-        # P001 is duplicate, older one pruned -> 1 duplicate removed
-        assert report.duplicates_removed == 1
-        # Final clean records: P001, P002, P003, P004, P006 = 5
-        assert report.final_clean_count == 5
-        assert len(records) == 5
+        assert len(records) == 0
+
+    def test_read_original_shc_sample_pdf_dataset(self) -> None:
+        """Verify full ingestion of the exact PDF sample dataset."""
+        sample_path = Path("data/patients_shc_sample.csv")
+        assert sample_path.exists()
+
+        records, report = read_and_clean_patient_data(sample_path)
+
+        assert report.total_rows_read == 9
+        # P-1002 safely recovered
+        assert report.malformed_rows_recovered == 1
+        assert report.malformed_rows_rejected == 0
+        # P-1001 and P-1003 deduplicated
+        assert report.duplicates_removed == 2
+        # Final unique patients: P-1001, P-1002, P-1003, P-1004, P-1005, P-1006, P-1007
+        assert report.final_clean_count == 7
+        assert len(records) == 7
+
+        # Verify P-1002 recovered balance
+        p1002 = next(r for r in records if r.patient_id == "P-1002")
+        assert p1002.account_balance == 1250.00
+
+        # Verify P-1007 negative balance $-15.00
+        p1007 = next(r for r in records if r.patient_id == "P-1007")
+        assert p1007.account_balance == -15.00
+
+        # Verify P-1001 retained newer record (0.00 from 2026-10-05)
+        p1001 = next(r for r in records if r.patient_id == "P-1001")
+        assert p1001.account_balance == 0.00
+        assert p1001.email == "john.doe@newemail.com"
 
     def test_duplicate_deduplication_keeps_latest_timestamp(self, tmp_path: Path) -> None:
         csv_content = (
@@ -202,5 +243,5 @@ class TestPatientDataIngestionAndDeduplication:
 
         assert saved_path.exists()
         content = saved_path.read_text(encoding="utf-8")
-        assert "patient_id,first_name,last_name,email,phone,dob,account_balance,last_modified" in content
-        assert "P500,Diana,Prince,diana@example.com,555-9999,1984-01-01,1250.5,2024-01-01T00:00:00+00:00" in content
+        assert "patient_id,first_name,last_name,dob,email,phone,account_balance,last_modified" in content
+        assert "P500,Diana,Prince,1984-01-01,diana@example.com,555-9999,1250.5,2024-01-01T00:00:00+00:00" in content

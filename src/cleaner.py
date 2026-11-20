@@ -4,6 +4,10 @@ This module processes raw legacy patient CSV exports, cleans and normalizes
 fields (DOB to ISO 8601, currency strings to float, handling missing contact info),
 validates mandatory fields, deduplicates records by patient_id based on the latest
 last_modified timestamp, and exports cleaned data to CSV.
+
+Includes safe recovery for legacy malformed rows containing unquoted commas in
+the account_balance field (e.g. '1,250.00'), with strict validation and quarantining
+of ambiguous rows to preserve data integrity.
 """
 
 from __future__ import annotations
@@ -21,14 +25,14 @@ logger = logging.getLogger("shc_ingestion.cleaner")
 # Regex pattern for currency symbols and extraneous whitespace
 CURRENCY_SYMBOLS_PATTERN = re.compile(r"[\$€₹£\s]")
 
-# Expected CSV column headers
+# Standard CSV column headers
 EXPECTED_HEADERS = [
     "patient_id",
     "first_name",
     "last_name",
+    "dob",
     "email",
     "phone",
-    "dob",
     "account_balance",
     "last_modified",
 ]
@@ -61,6 +65,7 @@ class CleaningReport:
 
     total_rows_read: int = 0
     valid_records_parsed: int = 0
+    malformed_rows_recovered: int = 0
     malformed_rows_rejected: int = 0
     invalid_records_rejected: int = 0
     duplicates_removed: int = 0
@@ -131,7 +136,7 @@ def parse_account_balance(balance_raw: Any) -> float:
     Handles:
       - Currency symbols: $, €, ₹, £
       - Comma separators: e.g. '1,250.00' -> 1250.00
-      - Negative balances: '-$50.00', '$-50.00', '-50.00', or accounting '($50.00)'
+      - Negative balances: '-$50.00', '$-50.00', '$-15.00', '-50.00', or accounting '($50.00)'
 
     Args:
         balance_raw: Raw balance representation (str, float, int).
@@ -159,7 +164,7 @@ def parse_account_balance(balance_raw: Any) -> float:
         is_negative = True
         val_str = val_str[1:-1].strip()
 
-    # Check for minus sign
+    # Check for minus sign (leading -$ or $- or trailing -)
     if "-" in val_str:
         is_negative = True
         val_str = val_str.replace("-", "").strip()
@@ -223,14 +228,77 @@ def parse_last_modified_timestamp(ts_raw: str) -> Tuple[str, datetime]:
         raise ValueError(f"Unable to parse last_modified timestamp '{cleaned_ts}': {err}") from err
 
 
+def attempt_recover_malformed_balance_row(
+    row: List[str],
+    headers: List[str],
+    header_index: Dict[str, int],
+) -> Optional[List[str]]:
+    """Attempt safe recovery of a malformed CSV row with an unquoted comma in account_balance.
+
+    Heuristic condition:
+      1. Row has exactly ONE additional column (len(row) == len(headers) + 1).
+      2. The final column row[-1] is a valid last_modified timestamp.
+      3. The account_balance column was split across an unquoted comma into
+         row[bal_idx] and row[bal_idx + 1]. Joining them with ',' produces
+         a valid parseable account balance.
+      4. The reconstructed row has exactly len(headers) columns.
+
+    If any condition is not met or recovery is ambiguous, returns None to signal
+    that the record should be quarantined rather than guessed.
+
+    Args:
+        row: Raw split row tokens.
+        headers: List of normalized header column names.
+        header_index: Mapping of column name to expected index.
+
+    Returns:
+        Reconstructed row tokens matching len(headers), or None if ambiguous/unrecoverable.
+    """
+    expected_len = len(headers)
+    if len(row) != expected_len + 1:
+        return None
+
+    # Condition 1: Final column must be a valid last_modified timestamp
+    final_field = row[-1].strip()
+    try:
+        parse_last_modified_timestamp(final_field)
+    except ValueError:
+        return None
+
+    if "account_balance" not in header_index:
+        return None
+
+    bal_idx = header_index["account_balance"]
+
+    # Reconstruct the candidate balance by joining the two split tokens
+    part1 = row[bal_idx]
+    part2 = row[bal_idx + 1]
+    reconstructed_balance_str = f"{part1},{part2}"
+
+    # Verify that the joined value parses into a valid numeric float
+    try:
+        parse_account_balance(reconstructed_balance_str)
+    except ValueError:
+        return None
+
+    # Assemble reconstructed row
+    reconstructed_row = row[:bal_idx] + [reconstructed_balance_str] + row[bal_idx + 2 :]
+
+    if len(reconstructed_row) != expected_len:
+        return None
+
+    return reconstructed_row
+
+
 def read_and_clean_patient_data(
     input_csv_path: str | Path,
 ) -> Tuple[List[PatientRecord], CleaningReport]:
     """Read raw patient CSV, validate fields, deduplicate, and return clean records.
 
-    Handles malformed rows (such as unquoted commas in account_balance) by detecting
-    column count mismatch, logging an explicit warning explaining the RFC 4180
-    violation, and discarding the corrupt row to protect data integrity.
+    Safely recovers malformed rows where account_balance contained an unquoted comma
+    (e.g. '1,250.00') when exactly one additional column is present and the final field
+    is a valid timestamp. If recovery is ambiguous or validation fails, quarantines
+    the row to protect clinical data integrity.
 
     Args:
         input_csv_path: Path to the raw CSV input file.
@@ -268,35 +336,29 @@ def read_and_clean_patient_data(
 
         for line_number, row in enumerate(reader, start=2):
             report.total_rows_read += 1
+            is_recovered = False
 
-            # Check for column count mismatch (e.g. malformed unquoted comma in balance)
+            # Check for column count mismatch
             if len(row) != expected_len:
-                report.malformed_rows_rejected += 1
-                reason = "Column count mismatch (unquoted comma in field)"
-                report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
+                # Attempt safe recovery for unquoted comma in account_balance
+                recovered_row = attempt_recover_malformed_balance_row(row, headers, header_index)
 
-                # Detect specific unquoted currency comma issue
-                row_preview = ",".join(row)
-                if len(row) > expected_len and any("." in field and len(field) == 2 for field in row):
+                if recovered_row is not None:
+                    row = recovered_row
+                    is_recovered = True
+                else:
+                    report.malformed_rows_rejected += 1
+                    reason = "Column count mismatch (ambiguous or unrecoverable malformed row)"
+                    report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
                     logger.warning(
-                        "Line %d: Rejected malformed CSV row with %d columns (expected %d). "
-                        "Suspected unquoted comma in account_balance (e.g. '1,250.00'). "
-                        "Per RFC 4180, fields containing commas MUST be enclosed in double quotes. "
+                        "Line %d: Quarantined malformed CSV row with %d columns (expected %d). "
                         "Raw row: [%s]",
                         line_number,
                         len(row),
                         expected_len,
-                        row_preview,
+                        ",".join(row),
                     )
-                else:
-                    logger.warning(
-                        "Line %d: Rejected malformed row with %d columns (expected %d). Content: %s",
-                        line_number,
-                        len(row),
-                        expected_len,
-                        row_preview,
-                    )
-                continue
+                    continue
 
             # Extract fields safely using header index
             raw_patient_id = row[header_index["patient_id"]].strip() if "patient_id" in header_index else ""
@@ -315,7 +377,7 @@ def read_and_clean_patient_data(
                 report.invalid_records_rejected += 1
                 reason = "Missing mandatory field: patient_id"
                 report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
-                logger.warning("Line %d: Rejected row missing mandatory 'patient_id'. Row: %s", line_number, row)
+                logger.warning("Line %d: Quarantined row missing mandatory 'patient_id'. Row: %s", line_number, row)
                 continue
 
             # Validation 2: Mandatory last_modified
@@ -324,7 +386,7 @@ def read_and_clean_patient_data(
                 reason = "Missing mandatory field: last_modified"
                 report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
                 logger.warning(
-                    "Line %d (patient_id=%s): Rejected row missing mandatory 'last_modified'.",
+                    "Line %d (patient_id=%s): Quarantined row missing mandatory 'last_modified'.",
                     line_number,
                     raw_patient_id,
                 )
@@ -337,7 +399,7 @@ def read_and_clean_patient_data(
                 reason = "Invalid last_modified timestamp"
                 report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
                 logger.warning(
-                    "Line %d (patient_id=%s): Rejected row with invalid last_modified '%s': %s",
+                    "Line %d (patient_id=%s): Quarantined row with invalid last_modified '%s': %s",
                     line_number,
                     raw_patient_id,
                     raw_last_modified,
@@ -353,7 +415,7 @@ def read_and_clean_patient_data(
                 reason = "Invalid or unparseable DOB"
                 report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
                 logger.warning(
-                    "Line %d (patient_id=%s): Rejected row with invalid DOB '%s': %s",
+                    "Line %d (patient_id=%s): Quarantined row with invalid DOB '%s': %s",
                     line_number,
                     raw_patient_id,
                     raw_dob,
@@ -369,13 +431,25 @@ def read_and_clean_patient_data(
                 reason = "Invalid account_balance format"
                 report.rejection_reasons[reason] = report.rejection_reasons.get(reason, 0) + 1
                 logger.warning(
-                    "Line %d (patient_id=%s): Rejected row with invalid account_balance '%s': %s",
+                    "Line %d (patient_id=%s): Quarantined row with invalid account_balance '%s': %s",
                     line_number,
                     raw_patient_id,
                     raw_balance,
                     err,
                 )
                 continue
+
+            # If successfully recovered from unquoted comma, record metric and log
+            if is_recovered:
+                report.malformed_rows_recovered += 1
+                logger.info(
+                    "Line %d (patient_id=%s): Safely recovered malformed row with unquoted comma in "
+                    "account_balance ('%s' -> %.2f). Please ensure upstream complies with RFC 4180.",
+                    line_number,
+                    raw_patient_id,
+                    raw_balance,
+                    normalized_balance,
+                )
 
             # Missing email and phone are allowed without crashing (clean default empty string)
             record = PatientRecord(
@@ -422,10 +496,11 @@ def read_and_clean_patient_data(
     report.final_clean_count = len(final_cleaned_records)
 
     logger.info(
-        "Data cleaning finished: Read=%d, Valid=%d, MalformedRejected=%d, "
-        "InvalidRejected=%d, DuplicatesPruned=%d, FinalClean=%d",
+        "Data cleaning finished: Read=%d, Valid=%d, MalformedRecovered=%d, "
+        "MalformedRejected=%d, InvalidRejected=%d, DuplicatesPruned=%d, FinalClean=%d",
         report.total_rows_read,
         report.valid_records_parsed,
+        report.malformed_rows_recovered,
         report.malformed_rows_rejected,
         report.invalid_records_rejected,
         report.duplicates_removed,
