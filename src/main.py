@@ -60,8 +60,8 @@ def parse_arguments() -> argparse.Namespace:
         "--input",
         "-i",
         dest="input_file",
-        default=os.getenv("INPUT_FILE", "data/patients.csv"),
-        help="Path to raw input patient CSV file (default: data/patients.csv)",
+        default=os.getenv("INPUT_FILE", "data/patients_shc_sample.csv"),
+        help="Path to raw input patient CSV file (default: data/patients_shc_sample.csv)",
     )
     parser.add_argument(
         "--output",

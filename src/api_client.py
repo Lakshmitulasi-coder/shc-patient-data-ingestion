@@ -5,7 +5,7 @@ for transmitting normalized patient records to the SHC platform.
 
 Features:
 - Bearer token authentication with credential masking in logs.
-- Automatic payload batching (default max 100 records per request).
+- Automatic payload batching strictly capped at a maximum of 100 records per request.
 - Sliding-window rate limiter strictly enforcing an absolute maximum of <= 5
   requests per second, regardless of environment configuration.
 - Exponential backoff with jitter for HTTP 429, HTTP 5xx, and network errors.
@@ -36,6 +36,9 @@ logger = logging.getLogger("shc_ingestion.api_client")
 # Absolute maximum API rate permitted by the SHC platform specification
 MAX_ALLOWED_RPS: float = 5.0
 
+# Absolute maximum records permitted in a single API batch payload
+MAX_BATCH_SIZE: int = 100
+
 
 def mask_token(token: Optional[str]) -> str:
     """Mask sensitive API tokens for safe logging.
@@ -55,18 +58,24 @@ def mask_token(token: Optional[str]) -> str:
 
 
 def chunk_records(records: List[Any], batch_size: int = 100) -> List[List[Any]]:
-    """Divide a list of records into batches of up to batch_size.
+    """Divide a list of records into batches clamped to a maximum of 100.
 
     Args:
         records: List of patient records (dicts or objects).
-        batch_size: Maximum elements per batch (default 100).
+        batch_size: Requested elements per batch (clamped to max 100).
 
     Returns:
         List of batched sublists.
+
+    Raises:
+        ValueError: If batch_size is not a positive integer.
     """
     if batch_size <= 0:
         raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
-    return [records[i : i + batch_size] for i in range(0, len(records), batch_size)]
+
+    # Enforce strict ceiling of MAX_BATCH_SIZE (100)
+    effective_size = min(MAX_BATCH_SIZE, batch_size)
+    return [records[i : i + effective_size] for i in range(0, len(records), effective_size)]
 
 
 def build_headers(api_token: str) -> Dict[str, str]:
@@ -251,8 +260,8 @@ class SHCPatientAPIClient:
         Args:
             base_url: REST endpoint URL.
             api_token: Bearer authentication token.
-            batch_size: Maximum records per HTTP request (default 100).
-            rate_limit_rps: Desired requests per second (strictly capped at 5.0).
+            batch_size: Maximum records per HTTP request (strictly clamped to max 100).
+            rate_limit_rps: Desired requests per second (strictly clamped to max 5.0).
             max_retries: Maximum retry attempts following an initial failure (default 3).
             initial_backoff: Base exponential backoff delay in seconds.
             backoff_factor: Multiplier per retry attempt.
@@ -262,7 +271,12 @@ class SHCPatientAPIClient:
         """
         self.base_url = (base_url or os.getenv("API_BASE_URL", "https://api.mock-shc.com/v1/patients")).rstrip("/")
         self.api_token = api_token or os.getenv("API_TOKEN", "")
-        self.batch_size = int(os.getenv("BATCH_SIZE", str(batch_size)))
+
+        # Enforce maximum batch size of 100 records regardless of configuration
+        raw_batch_size = int(os.getenv("BATCH_SIZE", str(batch_size)))
+        if raw_batch_size <= 0:
+            raise ValueError(f"BATCH_SIZE must be a positive integer, got {raw_batch_size}")
+        self.batch_size = min(MAX_BATCH_SIZE, raw_batch_size)
 
         # Enforce an absolute maximum API rate of 5 requests per second, even if configured above 5
         raw_configured_rps = float(os.getenv("RATE_LIMIT_RPS", str(rate_limit_rps)))
@@ -282,10 +296,11 @@ class SHCPatientAPIClient:
 
         masked_auth = mask_token(self.api_token)
         logger.info(
-            "Initialized SHCPatientAPIClient: URL=%s, Token=%s, BatchSize=%d, MaxRetries=%d, RateLimit=%.1frps (HardCap=%.1f)",
+            "Initialized SHCPatientAPIClient: URL=%s, Token=%s, BatchSize=%d (Max=%d), MaxRetries=%d, RateLimit=%.1frps (HardCap=%.1f)",
             self.base_url,
             masked_auth,
             self.batch_size,
+            MAX_BATCH_SIZE,
             self.max_retries,
             self.rate_limiter.max_rps,
             MAX_ALLOWED_RPS,
@@ -330,7 +345,6 @@ class SHCPatientAPIClient:
             self.base_url,
         )
 
-        # Total attempts = 1 initial request + up to max_retries retries
         total_attempts = 1 + self.max_retries
         retries_used = 0
 

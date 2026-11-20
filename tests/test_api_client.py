@@ -9,6 +9,7 @@ import responses
 
 from src.api_client import (
     MAX_ALLOWED_RPS,
+    MAX_BATCH_SIZE,
     RateLimiter,
     SHCPatientAPIClient,
     build_headers,
@@ -36,9 +37,32 @@ class TestUtilityFunctions:
         assert len(chunks[1]) == 100
         assert len(chunks[2]) == 50
 
+    def test_chunk_records_clamps_to_max_100(self) -> None:
+        items = list(range(250))
+        # Even if 500 is requested, chunk_records must enforce max 100
+        chunks = chunk_records(items, batch_size=500)
+        assert len(chunks) == 3
+        assert len(chunks[0]) == 100
+        assert len(chunks[1]) == 100
+        assert len(chunks[2]) == 50
+
     def test_chunk_records_invalid_size(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="positive integer"):
             chunk_records([1, 2, 3], batch_size=0)
+
+        with pytest.raises(ValueError, match="positive integer"):
+            chunk_records([1, 2, 3], batch_size=-5)
+
+    def test_client_enforces_max_batch_size_cap(self, monkeypatch) -> None:
+        monkeypatch.setenv("BATCH_SIZE", "500")
+        client = SHCPatientAPIClient()
+        assert client.batch_size == 100
+        assert client.batch_size == MAX_BATCH_SIZE
+
+    def test_client_rejects_invalid_batch_size(self, monkeypatch) -> None:
+        monkeypatch.setenv("BATCH_SIZE", "0")
+        with pytest.raises(ValueError, match="positive integer"):
+            SHCPatientAPIClient()
 
     def test_build_headers(self) -> None:
         headers = build_headers("my-secret-token")

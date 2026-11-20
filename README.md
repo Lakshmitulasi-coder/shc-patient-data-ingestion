@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Tests: Pytest](https://img.shields.io/badge/tests-36%20passed-brightgreen.svg)](https://docs.pytest.org/)
+[![Tests: Pytest](https://img.shields.io/badge/tests-40%20passed-brightgreen.svg)](https://docs.pytest.org/)
 
 Production-grade Forward Deployed Engineer (FDE) integration pipeline for extracting, sanitizing, deduplicating, and securely transmitting legacy healthcare records into modern REST platforms. Built for GlobalHealth Corp integration by SHC Technologies Pvt. Ltd.
 
@@ -282,7 +282,7 @@ docker run --rm -v $(pwd)/data:/app/data shc-patient-ingestion:1.0.0 --dry-run
 pytest -v
 ```
 
-All 36 tests cover date normalization, currency parsing, malformed unquoted comma recovery, ambiguous record quarantine, duplicate deduplication, rate limit hard-capping, exponential backoff, and mock API integration.
+All 40 tests cover date normalization, currency parsing, malformed unquoted comma recovery, ambiguous record quarantine, duplicate deduplication, rate limit hard-capping, exponential backoff, and mock API integration.
 
 ---
 
