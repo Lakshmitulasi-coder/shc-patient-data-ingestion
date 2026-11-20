@@ -1,0 +1,36 @@
+# Git files
+.git
+.gitignore
+
+# Python cache & compiled files
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+
+# Virtual environments
+.venv
+venv
+env
+
+# Environment secrets
+.env
+*.local
+
+# IDE configurations
+.vscode
+.idea
+
+# Documentation and communication
+client_communication.md
+README.md
+
+# Test files (optional: tests can be excluded from production container)
+tests/
+
+# Temporary files
+*.tmp
+*.log

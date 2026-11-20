@@ -1,0 +1,16 @@
+patient_id,first_name,last_name,email,phone,dob,account_balance,last_modified
+P001,John,Doe,john.doe@example.com,555-0101,04/15/1985,$150.00,2023-10-01T10:00:00Z
+P001,John,Doe,john.doe@example.com,555-0101,04/15/1985,$200.50,2023-11-15T14:30:00Z
+P002,Jane,Smith,,555-0102,1990-11-23,€350.75,2023-10-05T08:15:00Z
+P003,Robert,Johnson,robert.j@example.com,,23-08-1976,₹15000.00,2023-12-01T12:00:00Z
+P003,Robert,Johnson,robert.j@example.com,,23-08-1976,₹15000.00,2024-01-05T09:00:00Z
+P004,Emily,Davis,,,12/30/1995,-$50.00,2023-11-20T16:45:00Z
+P005,Michael,Brown,michael.b@example.com,555-0105,1982-05-18,($120.50),2023-10-12T11:20:00Z
+P006,Sarah,Wilson,sarah.w@example.com,555-0106,07-04-1988,"1,250.00",2023-12-10T15:00:00Z
+P007,David,Lee,david.lee@example.com,555-0107,1979-09-30,-75.25,2023-10-25T13:10:00Z
+P008,Lisa,Anderson,lisa.a@example.com,555-0108,03/25/1992,"€2,450.00",2023-11-05T10:30:00Z
+P009,Frank,Miller,frank.m@example.com,555-0109,1983-07-22,1,250.00,2023-12-05T11:00:00Z
+,Invalid,NoId,no.id@example.com,555-0110,1990-01-01,$100.00,2023-12-01T10:00:00Z
+P011,David,NoTimestamp,david.nt@example.com,555-0111,1988-03-15,$250.00,
+P012,Eva,BadDate,eva.bd@example.com,555-0112,1985-02-31,$300.00,2023-12-01T10:00:00Z
+P013,Grace,BadBalance,grace.bb@example.com,555-0113,1980-06-10,NOT_A_NUMBER,2023-12-01T10:00:00Z
