@@ -50,3 +50,5 @@ htmlcov/
 
 # Ingestion outputs & logs (retain structure but ignore local runtime artifacts if desired)
 *.log
+*.zip
+
