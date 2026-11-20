@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SHC Patient Ingestion & Data Quality Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background-color: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(150, 150, 150, 0.3); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(150, 150, 150, 0.5); }
+  </style>
+</head>
+<body class="p-6 antialiased">
+  <div class="max-w-6xl mx-auto space-y-4">
+    
+    <!-- Header & Status Banner -->
+    <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 p-4 rounded-xl bg-slate-800/80 border border-slate-700 shadow-sm">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-lg border border-emerald-500/30">
+          SHC
+        </div>
+        <div>
+          <h1 class="text-base font-semibold text-white flex items-center gap-2">
+            Patient Data Ingestion & Integration Dashboard
+            <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40">Pipeline Passed</span>
+          </h1>
+          <p class="text-xs text-slate-400">GlobalHealth Corp Legacy Migration • Execution Mode: Dry-Run / Validated</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2 text-xs">
+        <span class="px-2.5 py-1 rounded-md bg-slate-900/60 border border-slate-700 text-slate-300">
+          Target: <code class="text-emerald-400 font-mono">api.mock-shc.com/v1/patients</code>
+        </span>
+        <span class="px-2.5 py-1 rounded-md bg-slate-900/60 border border-slate-700 text-emerald-400 font-mono">
+          33/33 Tests Passing
+        </span>
+      </div>
+    </div>
+
+    <!-- Summary KPI Cards -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div class="p-3.5 rounded-lg bg-slate-800/80 border border-slate-700">
+        <div class="text-xs text-slate-400 font-medium">Total Rows Read</div>
+        <div class="text-2xl font-bold mt-1 text-white">15</div>
+        <div class="text-[11px] text-slate-400 mt-0.5">Raw legacy CSV rows</div>
+      </div>
+      <div class="p-3.5 rounded-lg bg-slate-800/80 border border-slate-700">
+        <div class="text-xs text-slate-400 font-medium">Cleaned & Normalized</div>
+        <div class="text-2xl font-bold mt-1 text-emerald-400">8</div>
+        <div class="text-[11px] text-emerald-400/80 mt-0.5">Written to cleaned_patients.csv</div>
+      </div>
+      <div class="p-3.5 rounded-lg bg-slate-800/80 border border-slate-700">
+        <div class="text-xs text-slate-400 font-medium">Duplicates Pruned</div>
+        <div class="text-2xl font-bold mt-1 text-amber-400">2</div>
+        <div class="text-[11px] text-amber-400/80 mt-0.5">Latest timestamp kept</div>
+      </div>
+      <div class="p-3.5 rounded-lg bg-slate-800/80 border border-slate-700">
+        <div class="text-xs text-slate-400 font-medium">Rejected / Malformed</div>
+        <div class="text-2xl font-bold mt-1 text-rose-400">5</div>
+        <div class="text-[11px] text-rose-400/80 mt-0.5">1 malformed + 4 validation fails</div>
+      </div>
+    </div>
+
+    <!-- Interactive Tabs -->
+    <div class="rounded-xl bg-slate-800/80 border border-slate-700 overflow-hidden shadow-sm">
+      <div class="flex border-b border-slate-700 bg-slate-900/40 px-2 pt-2 gap-1 text-xs font-medium">
+        <button onclick="switchTab('cleaned')" id="tab-cleaned" class="px-4 py-2 border-b-2 border-emerald-500 text-emerald-400 font-semibold transition-colors">
+          Cleaned Records (8)
+        </button>
+        <button onclick="switchTab('rejections')" id="tab-rejections" class="px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-white transition-colors">
+          Rejected Records & RFC 4180 Audit (5)
+        </button>
+        <button onclick="switchTab('dedup')" id="tab-dedup" class="px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-white transition-colors">
+          Deduplication Audit (2)
+        </button>
+        <button onclick="switchTab('api')" id="tab-api" class="px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-white transition-colors">
+          API Resilience & Limits
+        </button>
+      </div>
+
+      <!-- Tab 1: Cleaned Records -->
+      <div id="content-cleaned" class="p-4 space-y-3">
+        <div class="flex items-center justify-between gap-4">
+          <input 
+            type="text" 
+            id="searchInput" 
+            onkeyup="filterTable()" 
+            placeholder="Search by ID, name, email..." 
+            class="w-full max-w-xs px-3 py-1.5 rounded-md bg-slate-900/60 border border-slate-700 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+          />
+          <div class="text-xs text-slate-400">
+            Source: <code class="text-emerald-400">data/cleaned_patients.csv</code>
+          </div>
+        </div>
+
+        <div class="overflow-x-auto rounded-lg border border-slate-700">
+          <table class="w-full text-left text-xs" id="patientsTable">
+            <thead class="bg-slate-900/70 text-slate-400 border-b border-slate-700">
+              <tr>
+                <th class="p-2.5 font-semibold">Patient ID</th>
+                <th class="p-2.5 font-semibold">Full Name</th>
+                <th class="p-2.5 font-semibold">Contact (Email / Phone)</th>
+                <th class="p-2.5 font-semibold">Normalized DOB</th>
+                <th class="p-2.5 font-semibold text-right">Account Balance</th>
+                <th class="p-2.5 font-semibold">Last Modified (UTC)</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-700">
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P001</td>
+                <td class="p-2.5 font-medium text-white">John Doe</td>
+                <td class="p-2.5 text-slate-300">john.doe@example.com <span class="text-slate-500">•</span> 555-0101</td>
+                <td class="p-2.5 font-mono">1985-04-15 <span class="text-[10px] text-slate-500">(from 04/15/1985)</span></td>
+                <td class="p-2.5 text-right font-mono font-medium text-emerald-400">$200.50</td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-11-15T14:30:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P002</td>
+                <td class="p-2.5 font-medium text-white">Jane Smith</td>
+                <td class="p-2.5 text-slate-300"><span class="italic text-slate-500">[No Email]</span> <span class="text-slate-500">•</span> 555-0102</td>
+                <td class="p-2.5 font-mono">1990-11-23</td>
+                <td class="p-2.5 text-right font-mono font-medium text-emerald-400">$350.75 <span class="text-[10px] text-slate-500">(from €350.75)</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-10-05T08:15:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P003</td>
+                <td class="p-2.5 font-medium text-white">Robert Johnson</td>
+                <td class="p-2.5 text-slate-300">robert.j@example.com <span class="text-slate-500">•</span> <span class="italic text-slate-500">[No Phone]</span></td>
+                <td class="p-2.5 font-mono">1976-08-23 <span class="text-[10px] text-slate-500">(from 23-08-1976)</span></td>
+                <td class="p-2.5 text-right font-mono font-medium text-emerald-400">$15,000.00 <span class="text-[10px] text-slate-500">(from ₹15000)</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2024-01-05T09:00:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P004</td>
+                <td class="p-2.5 font-medium text-white">Emily Davis</td>
+                <td class="p-2.5 text-slate-300"><span class="italic text-slate-500">[No Email / No Phone]</span></td>
+                <td class="p-2.5 font-mono">1995-12-30 <span class="text-[10px] text-slate-500">(from 12/30/1995)</span></td>
+                <td class="p-2.5 text-right font-mono font-medium text-rose-400">-$50.00 <span class="text-[10px] text-slate-500">(Negative)</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-11-20T16:45:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P005</td>
+                <td class="p-2.5 font-medium text-white">Michael Brown</td>
+                <td class="p-2.5 text-slate-300">michael.b@example.com <span class="text-slate-500">•</span> 555-0105</td>
+                <td class="p-2.5 font-mono">1982-05-18</td>
+                <td class="p-2.5 text-right font-mono font-medium text-rose-400">-$120.50 <span class="text-[10px] text-slate-500">(from ($120.50))</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-10-12T11:20:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P006</td>
+                <td class="p-2.5 font-medium text-white">Sarah Wilson</td>
+                <td class="p-2.5 text-slate-300">sarah.w@example.com <span class="text-slate-500">•</span> 555-0106</td>
+                <td class="p-2.5 font-mono">1988-04-07 <span class="text-[10px] text-slate-500">(from 07-04-1988)</span></td>
+                <td class="p-2.5 text-right font-mono font-medium text-emerald-400">$1,250.00 <span class="text-[10px] text-slate-500">(quoted comma)</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-12-10T15:00:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P007</td>
+                <td class="p-2.5 font-medium text-white">David Lee</td>
+                <td class="p-2.5 text-slate-300">david.lee@example.com <span class="text-slate-500">•</span> 555-0107</td>
+                <td class="p-2.5 font-mono">1979-09-30</td>
+                <td class="p-2.5 text-right font-mono font-medium text-rose-400">-$75.25 <span class="text-[10px] text-slate-500">(Negative)</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-10-25T13:10:00Z</td>
+              </tr>
+              <tr class="hover:bg-slate-700/30 transition-colors">
+                <td class="p-2.5 font-mono font-medium text-emerald-400">P008</td>
+                <td class="p-2.5 font-medium text-white">Lisa Anderson</td>
+                <td class="p-2.5 text-slate-300">lisa.a@example.com <span class="text-slate-500">•</span> 555-0108</td>
+                <td class="p-2.5 font-mono">1992-03-25 <span class="text-[10px] text-slate-500">(from 03/25/1992)</span></td>
+                <td class="p-2.5 text-right font-mono font-medium text-emerald-400">$2,450.00 <span class="text-[10px] text-slate-500">(from €2,450.00)</span></td>
+                <td class="p-2.5 font-mono text-[11px] text-slate-400">2023-11-05T10:30:00Z</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Tab 2: Rejections & RFC 4180 Audit -->
+      <div id="content-rejections" class="p-4 space-y-3 hidden">
+        <div class="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300">
+          <strong>RFC 4180 Ingestion Defense:</strong> Corrupt rows are quarantined instead of silently misaligning columns. Below is the diagnostic audit of all 5 rejected rows from <code class="text-amber-200">data/patients.csv</code>.
+        </div>
+
+        <div class="space-y-2">
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-rose-500/30 flex flex-col gap-1 text-xs">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold text-rose-400">Line 12: Malformed Unquoted Comma in Account Balance (P009)</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300">Column Count Mismatch (9 instead of 8)</span>
+            </div>
+            <p class="text-slate-300">
+              Raw line: <code class="text-rose-300">P009,Frank,Miller,frank.m@example.com,555-0109,1983-07-22,1,250.00,2023-12-05T11:00:00Z</code>
+            </p>
+            <p class="text-slate-400 text-[11px]">
+              <strong>Root Cause:</strong> The balance value <code class="text-amber-300">1,250.00</code> was not wrapped in quotes. Standard CSV readers split this into two separate fields (<code class="text-amber-300">1</code> and <code class="text-amber-300">250.00</code>), shifting downstream columns. Protected by discarding this record.
+            </p>
+          </div>
+
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-rose-500/30 flex flex-col gap-1 text-xs">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold text-rose-400">Line 13: Missing Mandatory Field: patient_id</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300">Validation Error</span>
+            </div>
+            <p class="text-slate-300">
+              Raw line: <code class="text-rose-300">,Invalid,NoId,no.id@example.com,555-0110,1990-01-01,$100.00,2023-12-01T10:00:00Z</code>
+            </p>
+            <p class="text-slate-400 text-[11px]">Primary key cannot be null. Mandatory field validation failed.</p>
+          </div>
+
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-rose-500/30 flex flex-col gap-1 text-xs">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold text-rose-400">Line 14: Missing Mandatory Field: last_modified (P011)</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300">Validation Error</span>
+            </div>
+            <p class="text-slate-300">
+              Raw line: <code class="text-rose-300">P011,David,NoTimestamp,david.nt@example.com,555-0111,1988-03-15,$250.00,</code>
+            </p>
+            <p class="text-slate-400 text-[11px]">Audit timestamp is mandatory for tracking versioning and deduplication.</p>
+          </div>
+
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-rose-500/30 flex flex-col gap-1 text-xs">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold text-rose-400">Line 15: Invalid Calendar Date: 1985-02-31 (P012)</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300">Date Parse Error</span>
+            </div>
+            <p class="text-slate-300">
+              Raw line: <code class="text-rose-300">P012,Eva,BadDate,eva.bd@example.com,555-0112,1985-02-31,$300.00,2023-12-01T10:00:00Z</code>
+            </p>
+            <p class="text-slate-400 text-[11px]">February 31 is not a valid Gregorian calendar date.</p>
+          </div>
+
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-rose-500/30 flex flex-col gap-1 text-xs">
+            <div class="flex items-center justify-between">
+              <span class="font-semibold text-rose-400">Line 16: Invalid Account Balance: NOT_A_NUMBER (P013)</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-rose-500/20 text-rose-300">Type Conversion Error</span>
+            </div>
+            <p class="text-slate-300">
+              Raw line: <code class="text-rose-300">P013,Grace,BadBalance,grace.bb@example.com,555-0113,1980-06-10,NOT_A_NUMBER,2023-12-01T10:00:00Z</code>
+            </p>
+            <p class="text-slate-400 text-[11px]">String cannot be converted into an IEEE floating-point number.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Deduplication Audit -->
+      <div id="content-dedup" class="p-4 space-y-3 hidden">
+        <p class="text-xs text-slate-400">
+          Records sharing the same <code class="text-emerald-400">patient_id</code> are grouped and sorted by timestamp. The record with the latest <code class="text-emerald-400">last_modified</code> value is preserved, and previous revisions are retired.
+        </p>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-700 space-y-2 text-xs">
+            <div class="font-semibold text-emerald-400 flex items-center justify-between">
+              <span>Patient P001 (John Doe)</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">1 Duplicate Pruned</span>
+            </div>
+            <div class="p-2 rounded bg-emerald-500/10 border border-emerald-500/30">
+              <div class="font-semibold text-emerald-400">✓ RETAINED (Latest):</div>
+              <div class="font-mono text-[11px] mt-0.5 text-slate-300">Timestamp: 2023-11-15T14:30:00Z</div>
+              <div class="text-[11px] text-slate-400">Balance: $200.50 | Email: john.doe@example.com</div>
+            </div>
+            <div class="p-2 rounded bg-rose-500/10 border border-rose-500/30 opacity-70">
+              <div class="font-semibold text-rose-400">✗ DISCARDED (Older):</div>
+              <div class="font-mono text-[11px] mt-0.5 text-slate-300">Timestamp: 2023-10-01T10:00:00Z</div>
+              <div class="text-[11px] text-slate-400">Balance: $150.00</div>
+            </div>
+          </div>
+
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-700 space-y-2 text-xs">
+            <div class="font-semibold text-emerald-400 flex items-center justify-between">
+              <span>Patient P003 (Robert Johnson)</span>
+              <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">1 Duplicate Pruned</span>
+            </div>
+            <div class="p-2 rounded bg-emerald-500/10 border border-emerald-500/30">
+              <div class="font-semibold text-emerald-400">✓ RETAINED (Latest):</div>
+              <div class="font-mono text-[11px] mt-0.5 text-slate-300">Timestamp: 2024-01-05T09:00:00Z</div>
+              <div class="text-[11px] text-slate-400">Balance: ₹15,000.00 | Email: robert.j@example.com</div>
+            </div>
+            <div class="p-2 rounded bg-rose-500/10 border border-rose-500/30 opacity-70">
+              <div class="font-semibold text-rose-400">✗ DISCARDED (Older):</div>
+              <div class="font-mono text-[11px] mt-0.5 text-slate-300">Timestamp: 2023-12-01T12:00:00Z</div>
+              <div class="text-[11px] text-slate-400">Balance: ₹15,000.00</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 4: API Resilience & Limits -->
+      <div id="content-api" class="p-4 space-y-3 hidden text-xs">
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-700">
+            <div class="text-slate-400 font-medium">Batch Sizing</div>
+            <div class="text-lg font-bold text-emerald-400 mt-1">100 Records / Req</div>
+            <div class="text-[11px] text-slate-400 mt-0.5">Configurable via <code class="text-xs">BATCH_SIZE</code></div>
+          </div>
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-700">
+            <div class="text-slate-400 font-medium">Rate Limiting</div>
+            <div class="text-lg font-bold text-emerald-400 mt-1">5.0 Requests / Sec</div>
+            <div class="text-[11px] text-slate-400 mt-0.5">Enforced via Sliding Window Limiter</div>
+          </div>
+          <div class="p-3 rounded-lg bg-slate-900/60 border border-slate-700">
+            <div class="text-slate-400 font-medium">Retry Engine</div>
+            <div class="text-lg font-bold text-emerald-400 mt-1">Exponential + Jitter</div>
+            <div class="text-[11px] text-slate-400 mt-0.5">Handles HTTP 429, 5xx, & Timeouts</div>
+          </div>
+        </div>
+
+        <div class="p-3.5 rounded-lg bg-slate-900/60 border border-slate-700 space-y-2">
+          <h4 class="font-semibold text-white">Fault Tolerance Policies:</h4>
+          <ul class="space-y-1.5 text-slate-300">
+            <li>• <strong class="text-emerald-400">HTTP 400 Bad Request:</strong> Non-retriable. Automatically dumped to <code class="text-emerald-300">failed_records.json</code> with payload and error details. The pipeline continues uninterrupted for the next batch.</li>
+            <li>• <strong class="text-emerald-400">HTTP 429 Rate Limited:</strong> Reads <code class="text-emerald-300">Retry-After</code> header if provided by server; otherwise falls back to exponential backoff (1.0s * 2^(attempt-1) + jitter).</li>
+            <li>• <strong class="text-emerald-400">Credential Masking:</strong> Sensitive Bearer tokens are masked in all logs (<code class="text-emerald-300">mo****-xyz</code>) to maintain HIPAA / SOC-2 compliance.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    function switchTab(tabName) {
+      ['cleaned', 'rejections', 'dedup', 'api'].forEach(t => {
+        document.getElementById('content-' + t).classList.add('hidden');
+        document.getElementById('tab-' + t).className = 'px-4 py-2 border-b-2 border-transparent text-slate-400 hover:text-white transition-colors';
+      });
+      document.getElementById('content-' + tabName).classList.remove('hidden');
+      document.getElementById('tab-' + tabName).className = 'px-4 py-2 border-b-2 border-emerald-500 text-emerald-400 font-semibold transition-colors';
+    }
+
+    function filterTable() {
+      const query = document.getElementById('searchInput').value.toLowerCase();
+      const rows = document.querySelectorAll('#patientsTable tbody tr');
+      rows.forEach(row => {
+        const text = row.innerText.toLowerCase();
+        row.style.display = text.includes(query) ? '' : 'none';
+      });
+    }
+  </script>
+</body>
+</html>
